@@ -60,6 +60,9 @@ public class TestCuVSAcceleratedHNSWGaps extends LuceneTestCase {
   static int dimension;
   static float[][] dataset;
 
+  /** Documents that actually carry a vector: only the even-numbered ones are given one. */
+  static int numVectors;
+
   @BeforeClass
   public static void beforeClass() throws Exception {
     assumeTrue("cuVS not supported", isSupported());
@@ -79,6 +82,7 @@ public class TestCuVSAcceleratedHNSWGaps extends LuceneTestCase {
 
     datasetSize = random.nextInt(100, DATASET_SIZE_LIMIT);
     dimension = random.nextInt(8, DIMENSIONS_LIMIT);
+    numVectors = (datasetSize + 1) / 2;
     dataset = generateDataset(random, datasetSize, dimension);
 
     // Create documents where only even-numbered documents have vectors
@@ -121,8 +125,17 @@ public class TestCuVSAcceleratedHNSWGaps extends LuceneTestCase {
     Query query = new KnnFloatVectorQuery("vector", queryVector, topK);
     ScoreDoc[] hits = searcher.search(query, topK).scoreDocs;
 
-    // Verify we get exactly TOP_K results
-    assertEquals("Should return exactly " + topK + " results", topK, hits.length);
+    // Only even-numbered documents carry a vector, so the index holds numVectors of them — as few
+    // as 50 against a top-k limit of 64. Asking for more results than exist is worth covering on
+    // its own (the unfilled slots come back as sentinels and have to be dropped), so the draw
+    // keeps its full range and the expectation is what the index can actually supply.
+    int expectedHits = Math.min(topK, numVectors);
+    assertEquals(
+        String.format(
+            "Should return %d results (top-k %d, %d indexed vectors)",
+            expectedHits, topK, numVectors),
+        expectedHits,
+        hits.length);
 
     // Verify all returned documents have vectors (even-numbered IDs)
     for (ScoreDoc hit : hits) {
@@ -151,9 +164,10 @@ public class TestCuVSAcceleratedHNSWGaps extends LuceneTestCase {
     float[] queryVector = dataset[0];
     int topK = random.nextInt(5, TOP_K_LIMIT);
 
-    // Create a filter that only matches documents with ID less than 10
-    // This should further restrict our results to even numbers 0, 2, 4, 6, 8
-    Query filter = new TermQuery(new Term("id", "8")); // Only match document 8
+    // One matching document is fewer candidates than k, so Lucene answers this with an exact scan
+    // (documented on KnnFloatVectorQuery) rather than a graph search: document 8 is guaranteed to
+    // come back.
+    Query filter = new TermQuery(new Term("id", "8"));
 
     Query filteredQuery = new KnnFloatVectorQuery("vector", queryVector, topK, filter);
     ScoreDoc[] filteredHits = searcher.search(filteredQuery, topK).scoreDocs;

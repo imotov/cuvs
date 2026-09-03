@@ -28,8 +28,11 @@ import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Explanation;
+import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.KnnFloatVectorQuery;
 import org.apache.lucene.search.MatchNoDocsQuery;
@@ -60,12 +63,16 @@ import org.apache.lucene.util.FixedBitSet;
  * the acceptance mask (filter ∩ liveDocs) is packed into one {@link FilterBitsetHandle} per segment
  * and passed as that partition's filter. The host-side packed arrays are cached per unique
  * (filter, single-segment reader key, field) triple via {@link FilterBitsetCache}; the device
- * upload is cached inside the handle itself across threads.
+ * upload is cached inside the handle itself across threads. An explicit filter is still evaluated
+ * on every query — its per-segment cardinality is what decides whether an approximate search may
+ * run at all — so the cache saves the ordinal packing and the upload, not the filter evaluation.
  *
  * <p>Falls back to the standard per-segment Lucene path when the optimized path cannot be
- * applied: mixed segment types, a missing CAGRA index for the field on any segment, or segments
+ * applied: mixed segment types, a missing CAGRA index for the field on any segment, segments
  * whose built CAGRA graphs differ in degree (a single multi-partition request requires a uniform
- * graph degree, and a small segment can have its degree truncated at build time).
+ * graph degree, and a small segment can have its degree truncated at build time), or a filter
+ * under which {@link KnnFloatVectorQuery}'s documented exact-search strategy applies (see
+ * {@link #rewrite}).
  *
  * @since 25.10
  */
@@ -174,6 +181,27 @@ public class GPUKnnFloatVectorQuery extends KnnFloatVectorQuery {
         break;
       }
     }
+
+    // Evaluate an explicit filter once per segment, up front. The resulting bit sets serve twice:
+    // they are the acceptance masks the partitions are searched with, and their cardinality is the
+    // filter cost that decides whether an approximate search may run at all. KnnFloatVectorQuery
+    // documents that a filter leaving at most k candidates in a segment is answered by an exact
+    // scan, so those documents come back whatever their distance; CAGRA is approximate and can
+    // miss them. A query that selective is therefore handed to the per-segment Lucene path, which
+    // applies that rule itself. The whole query goes, not just the selective segment: one
+    // multi-partition request cannot leave a single partition out of the GPU search.
+    FixedBitSet[] segmentAcceptDocs = null;
+    if (hasExplicitFilter) {
+      Weight filterWeight = createFilterWeight(indexSearcher);
+      segmentAcceptDocs = new FixedBitSet[leaves.size()];
+      for (int i = 0; i < leaves.size(); i++) {
+        segmentAcceptDocs[i] = evalFilter(filterWeight, leaves.get(i));
+        if (segmentAcceptDocs[i].cardinality() <= k) {
+          return super.rewrite(indexSearcher);
+        }
+      }
+    }
+
     // Build the per-segment CagraIndex list (one entry per Lucene segment / cuVS partition).
     CuVSResources resources = getCuVSResourcesInstance();
     List<CagraIndex> cagraIndices = new ArrayList<>(leaves.size());
@@ -181,7 +209,7 @@ public class GPUKnnFloatVectorQuery extends KnnFloatVectorQuery {
     List<FilterBitsetHandle> filterHandles = null;
     try {
       if (hasExplicitFilter || hasDeletes) {
-        filterHandles = buildPerSegmentFilterHandles(indexSearcher, leaves, gpuReaders);
+        filterHandles = buildPerSegmentFilterHandles(leaves, gpuReaders, segmentAcceptDocs);
       }
 
       float[] target = getTargetCopy();
@@ -215,6 +243,16 @@ public class GPUKnnFloatVectorQuery extends KnnFloatVectorQuery {
 
         MultiPartitionSearchResults results =
             MultiPartitionCagraSearch.search(resources, cagraIndices, cagraQuery, k, filterHandles);
+
+        // The last of the three strategies KnnFloatVectorQuery documents: an approximate search
+        // that could not complete under a filter is redone exactly. Every segment cleared the
+        // cost > k check above, so more than k candidates were accepted and a search that found
+        // them all would have returned k; fewer means CAGRA under-filled its top-k (the unfilled
+        // slots carry a sentinel distance and are already dropped from count()). The per-segment
+        // Lucene path rescues that case per segment, so hand the query over.
+        if (hasExplicitFilter && results.count() < k) {
+          return super.rewrite(indexSearcher);
+        }
 
         if (results.count() == 0) {
           return new MatchNoDocsQuery();
@@ -262,9 +300,16 @@ public class GPUKnnFloatVectorQuery extends KnnFloatVectorQuery {
   }
 
   // -------------------------------------------------------------------------
-  // Per-segment fallback path (used when k > 1024 or not all GPU segments)
+  // Per-segment fallback path
   // -------------------------------------------------------------------------
 
+  /**
+   * Searches one segment, the hook Lucene drives once per leaf whenever {@link #rewrite} declined
+   * the multi-partition path — see that method for the cases. There is no cap on {@code k} here:
+   * {@link CuVS2510GPUVectorsReader} runs CAGRA up to k = 1024 and falls to its brute-force index
+   * above that, so a large k changes which cuVS index answers the search, not which path Lucene
+   * takes.
+   */
   @Override
   protected TopDocs approximateSearch(
       LeafReaderContext context,
@@ -295,20 +340,16 @@ public class GPUKnnFloatVectorQuery extends KnnFloatVectorQuery {
    *
    * <p>Each non-null handle carries a reference the caller must release with {@link
    * FilterBitsetHandle#decRef()} once the search completes.
+   *
+   * @param segmentAcceptDocs per-segment (filter ∩ liveDocs) masks already evaluated by {@link
+   *     #rewrite}, in {@code leaves} order, or {@code null} when the query has no explicit filter
+   *     and only deletes need masking
    */
   private List<FilterBitsetHandle> buildPerSegmentFilterHandles(
-      IndexSearcher indexSearcher,
       List<LeafReaderContext> leaves,
-      List<CuVS2510GPUVectorsReader> gpuReaders)
+      List<CuVS2510GPUVectorsReader> gpuReaders,
+      FixedBitSet[] segmentAcceptDocs)
       throws IOException {
-
-    Weight filterWeight = null;
-    if (filter != null) {
-      filterWeight =
-          indexSearcher.createWeight(
-              indexSearcher.rewrite(filter), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
-    }
-    final Weight sharedFilterWeight = filterWeight;
 
     final int n = leaves.size();
     boolean[] needsFilter = new boolean[n];
@@ -350,11 +391,15 @@ public class GPUKnnFloatVectorQuery extends KnnFloatVectorQuery {
         LeafReaderContext ctx = leaves.get(i);
         FloatVectorValues fvv = fvvs[i];
         FilterBitsetCache cache = caches[i];
+        // With an explicit filter the mask is the one already evaluated in rewrite(); without one,
+        // this segment is here because it has deletes, so liveDocs alone is the mask.
+        final Bits acceptDocs =
+            (segmentAcceptDocs != null) ? segmentAcceptDocs[i] : ctx.reader().getLiveDocs();
         // When caching is disabled, route every segment through the uncached, caller-owned path.
         var helper = cache.isEnabled() ? ctx.reader().getReaderCacheHelper() : null;
         if (helper == null) {
           // This reader can't be cached; build an uncached handle owned outright by the caller.
-          handles.add(buildSegmentFilterHandle(sharedFilterWeight, ctx, fvv));
+          handles.add(buildSegmentFilterHandle(acceptDocs, fvv));
         } else {
           // Evict entries when this segment reader closes (merge/reopen), not just on LRU.
           cache.ensureCloseListener(helper);
@@ -364,7 +409,7 @@ public class GPUKnnFloatVectorQuery extends KnnFloatVectorQuery {
                   helper.getKey(),
                   field,
                   entryBytes[i],
-                  () -> buildSegmentFilterHandle(sharedFilterWeight, ctx, fvv)));
+                  () -> buildSegmentFilterHandle(acceptDocs, fvv)));
         }
       }
       return handles;
@@ -379,18 +424,13 @@ public class GPUKnnFloatVectorQuery extends KnnFloatVectorQuery {
   }
 
   /**
-   * Evaluates {@code filterWeight} (when non-null) in {@code ctx}, intersects with liveDocs, and
-   * packs the accepted ordinals of this one segment into a new {@link FilterBitsetHandle}. When
-   * {@code filterWeight} is {@code null}, the handle encodes liveDocs alone — the path taken for a
-   * segment with deletes but no explicit Lucene filter.
+   * Packs the ordinals of {@code fvv} accepted by {@code acceptDocs} into a new {@link
+   * FilterBitsetHandle}. {@code acceptDocs} is this segment's (filter ∩ liveDocs) mask, or its
+   * liveDocs alone for a segment with deletes but no explicit Lucene filter; {@code null} follows
+   * the Lucene convention that every document is accepted.
    */
-  private FilterBitsetHandle buildSegmentFilterHandle(
-      Weight filterWeight, LeafReaderContext ctx, FloatVectorValues fvv) throws IOException {
-    Bits liveDocs = ctx.reader().getLiveDocs();
-    // When filterWeight is null, accept all live documents (acceptDocs == liveDocs, which may
-    // itself
-    // be null to mean "all docs accepted" in this segment).
-    Bits acceptDocs = (filterWeight != null) ? evalFilter(filterWeight, ctx, liveDocs) : liveDocs;
+  private static FilterBitsetHandle buildSegmentFilterHandle(
+      Bits acceptDocs, FloatVectorValues fvv) {
     Bits acceptedOrds = fvv.getAcceptOrds(acceptDocs);
     int numOrds = fvv.size();
     long[] segLongs = new long[(int) (((long) numOrds + 63) / 64)];
@@ -399,40 +439,45 @@ public class GPUKnnFloatVectorQuery extends KnnFloatVectorQuery {
   }
 
   /**
-   * Evaluates {@code filterWeight} in {@code ctx} and intersects with {@code liveDocs}.
-   * Returns a {@link Bits} over local doc IDs where {@code get(doc)} is true for accepted docs.
+   * Creates the weight for (the explicit filter ∩ the documents that carry a vector for this
+   * field), the same conjunction {@code AbstractKnnVectorQuery} filters with. Including {@link
+   * FieldExistsQuery} is what makes the resulting cardinality comparable to Lucene's filter cost:
+   * a document matching the filter but holding no vector is not a candidate and must not count
+   * towards it.
    */
-  private static Bits evalFilter(Weight filterWeight, LeafReaderContext ctx, Bits liveDocs)
+  private Weight createFilterWeight(IndexSearcher indexSearcher) throws IOException {
+    BooleanQuery conjunction =
+        new BooleanQuery.Builder()
+            .add(filter, BooleanClause.Occur.FILTER)
+            .add(new FieldExistsQuery(field), BooleanClause.Occur.FILTER)
+            .build();
+    return indexSearcher.createWeight(
+        indexSearcher.rewrite(conjunction), ScoreMode.COMPLETE_NO_SCORES, 1.0f);
+  }
+
+  /**
+   * Evaluates {@code filterWeight} in {@code ctx}, intersected with that segment's liveDocs, as a
+   * materialized bit set over local doc IDs. Materializing it rather than wrapping the filter
+   * lazily makes {@link FixedBitSet#cardinality()} — the filter cost the exact-search decision
+   * reads — available without a second pass over the filter.
+   */
+  private static FixedBitSet evalFilter(Weight filterWeight, LeafReaderContext ctx)
       throws IOException {
+    FixedBitSet filterBits = new FixedBitSet(ctx.reader().maxDoc());
     ScorerSupplier scorerSupplier = filterWeight.scorerSupplier(ctx);
     if (scorerSupplier == null) {
       // No scorer: the filter matches no documents in this segment.
-      return new Bits.MatchNoBits(ctx.reader().maxDoc());
+      return filterBits;
     }
-
-    int maxDoc = ctx.reader().maxDoc();
-    FixedBitSet filterBits = new FixedBitSet(maxDoc);
-    Scorer scorer = scorerSupplier.get(Long.MAX_VALUE);
-    DocIdSetIterator it = scorer.iterator();
+    Bits liveDocs = ctx.reader().getLiveDocs();
+    DocIdSetIterator it = scorerSupplier.get(Long.MAX_VALUE).iterator();
     int doc;
     while ((doc = it.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
-      filterBits.set(doc);
+      if (liveDocs == null || liveDocs.get(doc)) {
+        filterBits.set(doc);
+      }
     }
-
-    if (liveDocs == null) return filterBits;
-
-    // Intersect: accept only docs that pass both filter and liveDocs.
-    return new Bits() {
-      @Override
-      public boolean get(int i) {
-        return filterBits.get(i) && liveDocs.get(i);
-      }
-
-      @Override
-      public int length() {
-        return maxDoc;
-      }
-    };
+    return filterBits;
   }
 
   /**

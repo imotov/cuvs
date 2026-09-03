@@ -53,10 +53,14 @@ public class TestCuVSGaps extends LuceneTestCase {
   static int DIMENSIONS_LIMIT = 2048;
   static int NUM_QUERIES_LIMIT = 10;
   static int TOP_K_LIMIT = 64;
+  static int SEARCH_WIDTH = 8;
 
   static int datasetSize;
   static int dimension;
   static float[][] dataset;
+
+  /** Documents that actually carry a vector: only the even-numbered ones are given one. */
+  static int numVectors;
 
   @BeforeClass
   public static void beforeClass() throws Exception {
@@ -77,6 +81,7 @@ public class TestCuVSGaps extends LuceneTestCase {
 
     datasetSize = random.nextInt(100, DATASET_SIZE_LIMIT);
     dimension = random.nextInt(8, DIMENSIONS_LIMIT);
+    numVectors = (datasetSize + 1) / 2;
     dataset = generateDataset(random, datasetSize, dimension);
 
     // Create documents where only even-numbered documents have vectors
@@ -116,12 +121,26 @@ public class TestCuVSGaps extends LuceneTestCase {
     float[] queryVector = dataset[0];
     int topK = random.nextInt(5, TOP_K_LIMIT);
 
+    // A search budget wide enough that CAGRA is effectively exhaustive at this scale. The
+    // assertions below demand the exact top-k, and this test is about gap handling — mapping
+    // ordinals back to documents when only some documents have a vector — not about how an
+    // approximate search fares on a minimal budget.
     GPUKnnFloatVectorQuery query =
-        new GPUKnnFloatVectorQuery("vector", queryVector, topK, null, topK, 1);
+        new GPUKnnFloatVectorQuery(
+            "vector", queryVector, topK, null, Math.max(64, 2 * topK), SEARCH_WIDTH);
     ScoreDoc[] hits = searcher.search(query, topK).scoreDocs;
 
-    // Verify we get exactly TOP_K results
-    assertEquals("Should return exactly " + topK + " results", topK, hits.length);
+    // Only even-numbered documents carry a vector, so the index holds numVectors of them — as few
+    // as 50 against a top-k limit of 64. Asking for more results than exist is worth covering on
+    // its own (the unfilled slots come back as sentinels and have to be dropped), so the draw
+    // keeps its full range and the expectation is what the index can actually supply.
+    int expectedHits = Math.min(topK, numVectors);
+    assertEquals(
+        String.format(
+            "Should return %d results (top-k %d, %d indexed vectors)",
+            expectedHits, topK, numVectors),
+        expectedHits,
+        hits.length);
 
     // Verify all returned documents have vectors (even-numbered IDs)
     for (ScoreDoc hit : hits) {
@@ -150,9 +169,11 @@ public class TestCuVSGaps extends LuceneTestCase {
     float[] queryVector = dataset[0];
     int topK = random.nextInt(5, TOP_K_LIMIT);
 
-    // Create a filter that only matches documents with ID less than 10
-    // This should further restrict our results to even numbers 0, 2, 4, 6, 8
-    Query filter = new TermQuery(new Term("id", "8")); // Only match document 8
+    // One matching document is fewer candidates than k, which is Lucene's threshold for answering
+    // a kNN query with an exact scan (documented on KnnFloatVectorQuery). So this asserts that the
+    // GPU query defers to that path, not CAGRA's recall — an approximate search cannot be required
+    // to find a single accepted vector among hundreds. See GPUKnnFloatVectorQuery.rewrite().
+    Query filter = new TermQuery(new Term("id", "8"));
 
     GPUKnnFloatVectorQuery filteredQuery =
         new GPUKnnFloatVectorQuery("vector", queryVector, topK, filter, topK, 1);
