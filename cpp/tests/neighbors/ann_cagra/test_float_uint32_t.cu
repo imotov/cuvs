@@ -56,6 +56,17 @@ INSTANTIATE_TEST_CASE_P(AnnCagraMultiPartitionTest,
                         AnnCagraMultiPartitionTestF_U32,
                         ::testing::ValuesIn(inputs_mp));
 
+typedef AnnCagraMultiPartitionTest<float, float, std::uint32_t>
+  AnnCagraMultiPartitionSelectiveFilterTestF_U32;
+TEST_P(AnnCagraMultiPartitionSelectiveFilterTestF_U32, FilteredSearch)
+{
+  this->testSelectiveFilteredSearch();
+}
+
+INSTANTIATE_TEST_CASE_P(AnnCagraMultiPartitionSelectiveFilterTest,
+                        AnnCagraMultiPartitionSelectiveFilterTestF_U32,
+                        ::testing::ValuesIn(inputs_mp_selective_filter));
+
 // Builds one CAGRA index per {metric, graph_degree} spec over a shared random dataset, then asserts
 // a multi-partition search over them throws. Shared by the rejection tests below, which each
 // violate one "all partitions must be uniform / supported" precondition. The rejections are

@@ -1844,6 +1844,11 @@ void search(raft::resources const& res,
  * may differ. Compressed (VPQ) datasets are not currently supported in multi-partition search, so
  * partitions must be built on in-memory strided datasets.
  *
+ * @note When @p partition_bitsets filters any partition and @p params.filtering_rate is negative,
+ * the filtering rate is computed from the bitsets, which synchronizes the stream once. All
+ * partitions share one search plan, so the rate of the most selective partition is used; a
+ * partition whose bitset accepts no rows is not counted.
+ *
  * @param[in]  res            raft resources
  * @param[in]  params         search parameters (shared across partitions)
  * @param[in]  indices        CAGRA index objects, one per partition
@@ -1883,6 +1888,11 @@ void search(
  * may differ. Compressed (VPQ) datasets are not currently supported in multi-partition search, so
  * partitions must be built on in-memory strided datasets.
  *
+ * @note When @p partition_bitsets filters any partition and @p params.filtering_rate is negative,
+ * the filtering rate is computed from the bitsets, which synchronizes the stream once. All
+ * partitions share one search plan, so the rate of the most selective partition is used; a
+ * partition whose bitset accepts no rows is not counted.
+ *
  * @param[in]  res            raft resources
  * @param[in]  params         search parameters (shared across partitions)
  * @param[in]  indices        CAGRA index objects, one per partition
@@ -1921,6 +1931,11 @@ void search(
  * @note All index partitions must use the same distance metric and graph degree; partition sizes
  * may differ. Compressed (VPQ) datasets are not currently supported in multi-partition search, so
  * partitions must be built on in-memory strided datasets.
+ *
+ * @note When @p partition_bitsets filters any partition and @p params.filtering_rate is negative,
+ * the filtering rate is computed from the bitsets, which synchronizes the stream once. All
+ * partitions share one search plan, so the rate of the most selective partition is used; a
+ * partition whose bitset accepts no rows is not counted.
  *
  * @param[in]  res            raft resources
  * @param[in]  params         search parameters (shared across partitions)
@@ -1961,6 +1976,11 @@ void search(
  * may differ. Compressed (VPQ) datasets are not currently supported in multi-partition search, so
  * partitions must be built on in-memory strided datasets.
  *
+ * @note When @p partition_bitsets filters any partition and @p params.filtering_rate is negative,
+ * the filtering rate is computed from the bitsets, which synchronizes the stream once. All
+ * partitions share one search plan, so the rate of the most selective partition is used; a
+ * partition whose bitset accepts no rows is not counted.
+ *
  * @param[in]  res            raft resources
  * @param[in]  params         search parameters (shared across partitions)
  * @param[in]  indices        CAGRA index objects, one per partition
@@ -1999,6 +2019,11 @@ void search(
  * @note All index partitions must use the same distance metric and graph degree; partition sizes
  * may differ. Compressed (VPQ) datasets are not currently supported in multi-partition search, so
  * partitions must be built on in-memory strided datasets.
+ *
+ * @note When @p partition_bitsets filters any partition and @p params.filtering_rate is negative,
+ * the filtering rate is computed from the bitsets, which synchronizes the stream once. All
+ * partitions share one search plan, so the rate of the most selective partition is used; a
+ * partition whose bitset accepts no rows is not counted.
  *
  * @param[in]  res            raft resources
  * @param[in]  params         search parameters (shared across partitions)
@@ -2039,6 +2064,11 @@ void search(
  * may differ. Compressed (VPQ) datasets are not currently supported in multi-partition search, so
  * partitions must be built on in-memory strided datasets.
  *
+ * @note When @p partition_bitsets filters any partition and @p params.filtering_rate is negative,
+ * the filtering rate is computed from the bitsets, which synchronizes the stream once. All
+ * partitions share one search plan, so the rate of the most selective partition is used; a
+ * partition whose bitset accepts no rows is not counted.
+ *
  * @param[in]  res            raft resources
  * @param[in]  params         search parameters (shared across partitions)
  * @param[in]  indices        CAGRA index objects, one per partition
@@ -2077,6 +2107,11 @@ void search(
  * @note All index partitions must use the same distance metric and graph degree; partition sizes
  * may differ. Compressed (VPQ) datasets are not currently supported in multi-partition search, so
  * partitions must be built on in-memory strided datasets.
+ *
+ * @note When @p partition_bitsets filters any partition and @p params.filtering_rate is negative,
+ * the filtering rate is computed from the bitsets, which synchronizes the stream once. All
+ * partitions share one search plan, so the rate of the most selective partition is used; a
+ * partition whose bitset accepts no rows is not counted.
  *
  * @param[in]  res            raft resources
  * @param[in]  params         search parameters (shared across partitions)
@@ -2116,6 +2151,11 @@ void search(
  * @note All index partitions must use the same distance metric and graph degree; partition sizes
  * may differ. Compressed (VPQ) datasets are not currently supported in multi-partition search, so
  * partitions must be built on in-memory strided datasets.
+ *
+ * @note When @p partition_bitsets filters any partition and @p params.filtering_rate is negative,
+ * the filtering rate is computed from the bitsets, which synchronizes the stream once. All
+ * partitions share one search plan, so the rate of the most selective partition is used; a
+ * partition whose bitset accepts no rows is not counted.
  *
  * @param[in]  res            raft resources
  * @param[in]  params         search parameters (shared across partitions)

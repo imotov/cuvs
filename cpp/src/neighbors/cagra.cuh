@@ -12,13 +12,16 @@
 #include "detail/cagra/cagra_search.cuh"
 #include "detail/cagra/graph_core.cuh"
 
+#include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/host_device_accessor.hpp>
 #include <raft/core/logger.hpp>
 #include <raft/core/mdspan.hpp>
+#include <raft/core/resource/cuda_stream.hpp>
 #include <raft/core/resources.hpp>
 #include <raft/linalg/norm.cuh>
 #include <raft/linalg/reduce.cuh>
+#include <raft/util/cudart_utils.hpp>
 
 #include <cuvs/core/bitset.hpp>
 #include <cuvs/core/roaring_allowlist.hpp>
@@ -29,6 +32,7 @@
 #include <algorithm>
 #include <optional>
 #include <type_traits>
+#include <vector>
 
 namespace cuvs::neighbors::cagra {
 
@@ -606,10 +610,48 @@ void search(
                                           cuvs::neighbors::filtering::none_sample_filter>(
       res, params, indices, queries, partition_ids, neighbors, distances, partition_bitsets);
   } else {
+    // All partitions share one search plan, so size it for the most selective partition, as the
+    // single-index search does for its bitset. Only the first n_rows bits of a partition's bitset
+    // are read by the search. A partition whose filter accepts no rows contributes no results
+    // whatever the plan, so it is left out rather than inflating the itopk of every partition.
+    search_params params_copy = params;
+    if (params.filtering_rate < 0.0) {
+      // Count every partition's accepted rows on the device, then read them back with one sync.
+      const size_t num_partitions = indices.size();
+      auto counts                 = raft::make_device_vector<int64_t, int64_t>(res, num_partitions);
+      std::vector<bool> filtered(num_partitions, false);
+      for (size_t i = 0; i < partition_bitsets.size() && i < num_partitions; i++) {
+        const auto& v        = partition_bitsets[i];
+        const int64_t n_rows = indices[i]->dataset().n_rows();
+        if (v.data() == nullptr || v.size() == 0 || n_rows == 0) { continue; }
+        cuvs::core::bitset_view<std::uint32_t, int64_t>(const_cast<std::uint32_t*>(v.data()),
+                                                        std::min<int64_t>(v.size(), n_rows))
+          .count(res, raft::make_device_scalar_view<int64_t>(counts.data_handle() + i));
+        filtered[i] = true;
+      }
+      std::vector<int64_t> num_set_bits(num_partitions, 0);
+      raft::update_host(num_set_bits.data(),
+                        counts.data_handle(),
+                        num_partitions,
+                        raft::resource::get_cuda_stream(res));
+      raft::resource::sync_stream(res);
+
+      float filtering_rate = 0.0f;
+      for (size_t i = 0; i < num_partitions; i++) {
+        if (!filtered[i] || num_set_bits[i] == 0) { continue; }
+        const int64_t n_rows = indices[i]->dataset().n_rows();
+        filtering_rate =
+          std::max(filtering_rate, static_cast<float>(n_rows - num_set_bits[i]) / n_rows);
+      }
+      const float min_filtering_rate = 0.0;
+      const float max_filtering_rate = 0.999;
+      params_copy.filtering_rate =
+        std::min(std::max(filtering_rate, min_filtering_rate), max_filtering_rate);
+    }
     using bitset_filter_t = cuvs::neighbors::filtering::bitset_filter<std::uint32_t, int64_t>;
     cagra::detail::search_multi_partition<T, OutputIdxT, IdxT, float, bitset_filter_t>(
       res,
-      params,
+      params_copy,
       indices,
       queries,
       partition_ids,
